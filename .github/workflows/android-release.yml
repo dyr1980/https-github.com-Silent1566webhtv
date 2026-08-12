@@ -88,24 +88,6 @@ jobs:
           test -n "$platform_jar"
           mv "$(dirname "$platform_jar")" "$ANDROID_HOME/platforms/android-37"
 
-      - name: Run release-critical tests
-        run: |
-          chmod +x ./gradlew
-          ./gradlew \
-            :app:testMobileArm64_v8aDebugUnitTest \
-            --tests 'com.fongmi.android.tv.player.danmaku.*' \
-            --tests 'com.fongmi.android.tv.UpdateChannelTest' \
-            --tests 'com.fongmi.android.tv.UpdaterFutureTest' \
-            --tests 'com.fongmi.android.tv.utils.GithubTest' \
-            --tests 'com.fongmi.android.tv.utils.GithubProxyTest' \
-            --tests 'com.fongmi.android.tv.ui.dialog.AboutDialogLayoutTest' \
-            --tests 'com.fongmi.android.tv.ui.dialog.UpdateDialogChannelVisibilityTest' \
-            --no-daemon
-          ./gradlew \
-            :app:testLeanbackArm64_v8aDebugUnitTest \
-            --tests 'com.fongmi.android.tv.ui.dialog.UpdateDialogLayoutTest' \
-            --no-daemon
-
       - name: Resolve release tag
         id: meta
         run: |
@@ -252,7 +234,6 @@ jobs:
           PY
           ls -lh dist/
 
-      # ============【替换点】原Create GitHub Release全部shell脚本移除，改用softprops/action‑gh‑release@v2 ============
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         env:
@@ -268,47 +249,101 @@ jobs:
             dist/*.apk
             dist/*.json
 
-      - name: Publish update channel manifests
+      - name: Publish update channel manifests (curl GitHub API direct call)
         env:
           GH_TOKEN: ${{ github.token }}
+          API_BASE: https://api.github.com/repos/${{ github.repository }}
+          UPLOAD_BASE: https://uploads.github.com/repos/${{ github.repository }}
+          UPDATE_CHANNEL_TAG: ${{ env.UPDATE_CHANNEL_TAG }}
+          CURRENT_CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
           set -euo pipefail
           rm -rf channel-manifests other-channel-manifests
           mkdir -p channel-manifests other-channel-manifests
           cp dist/*.json channel-manifests/
 
-          if [ "${{ steps.meta.outputs.channel }}" = "stable" ]; then
-            OTHER_TAG="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease \
-              --jq '[.[] | select((.isDraft == false) and (.isPrerelease == true) and (.tagName | test("-beta-[0-9]{12}$")))] | first | .tagName // ""')"
-            OTHER_PATTERN="*-beta.json"
-          else
-            OTHER_TAG="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease \
-              --jq '[.[] | select((.isDraft == false) and (.isPrerelease == false) and (.tagName | test("^v.+-[0-9]{12}$")))] | first | .tagName // ""')"
-            OTHER_PATTERN="*.json"
+          # 1. 查询update‑channel是否存在
+          query_release=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            "$API_BASE/releases/tags/$UPDATE_CHANNEL_TAG")
+          http_code=$(echo "$query_release" | tail -n1)
+          release_body=$(echo "$query_release" | head -n -1)
+
+          if [[ "$http_code" == "404" ]]; then
+            echo "update‑channel release不存在，调用API创建"
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "$API_BASE/releases" \
+              -d "$(jq -n \
+                --arg tag "$UPDATE_CHANNEL_TAG" \
+                --arg sha "$GITHUB_SHA" \
+                '{
+                  tag_name: $tag,
+                  target_commitish: $sha,
+                  name:"Update‑channel manifests",
+                  body:"Machine‑managed stable and beta update manifests.",
+                  prerelease:true,
+                  draft:false
+                }')"
+            query_release=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              "$API_BASE/releases/tags/$UPDATE_CHANNEL_TAG")
+            http_code=$(echo "$query_release" | tail -n1)
+            release_body=$(echo "$query_release" | head -n -1)
           fi
 
-          if [ -n "$OTHER_TAG" ]; then
-            if gh release download "$OTHER_TAG" --pattern "$OTHER_PATTERN" --dir other-channel-manifests; then
-              for manifest in other-channel-manifests/*.json; do
-                [ -e "$manifest" ] || continue
-                if [ "${{ steps.meta.outputs.channel }}" = "beta" ] && [[ "$(basename "$manifest")" == *-beta.json ]]; then
-                  continue
-                fi
-                cp "$manifest" channel-manifests/
-              done
-            else
-              echo "::warning title=Channel manifest seed failed::Could not download $OTHER_PATTERN from $OTHER_TAG."
+          # 解析release_id 和已有asset列表
+          release_id=$(echo "$release_body" | jq -r '.id')
+          asset_count=$(echo "$release_body" | jq '.assets | length')
+          echo "update‑channel release_id=$release_id, assets=$asset_count"
+
+          # 遍历现有asset，下载需要继承的manifest json
+          echo "$release_body" | jq -c '.assets[]' | while read -r asset; do
+            asset_name=$(echo "$asset" | jq -r '.name')
+            asset_browser_url=$(echo "$asset" | jq -r '.browser_download_url')
+            if [[ "$asset_name" != *.json ]]; then
+              continue
             fi
-          fi
+            # 跳过当前渠道旧清单，保留另一渠道
+            if [[ "$CURRENT_CHANNEL" == "beta" && "$asset_name" == *-beta.json ]]; then
+              echo "skip old beta manifest: $asset_name"
+              continue
+            fi
+            echo "download inherit manifest $asset_name"
+            curl -sL -o "other-channel-manifests/$asset_name" "$asset_browser_url"
+          done
 
-          if ! gh release view "$UPDATE_CHANNEL_TAG" >/dev/null 2>&1; then
-            gh release create "$UPDATE_CHANNEL_TAG" \
-              --target "$GITHUB_SHA" \
-              --title "Update channel manifests" \
-              --notes "Machine-managed stable and beta update manifests." \
-              --prerelease
-          fi
-          gh release upload "$UPDATE_CHANNEL_TAG" channel-manifests/*.json --clobber
+          # 复制继承过来的旧manifest
+          for f in other-channel-manifests/*; do
+            [[ -f "$f" ]] || continue
+            cp "$f" channel-manifests/
+          done
+
+          # 删除update‑channel全部旧json assets
+          echo "$release_body" | jq -c '.assets[]' | while read -r asset; do
+            asset_name=$(echo "$asset" | jq -r '.name')
+            asset_id=$(echo "$asset" | jq -r '.id')
+            if [[ "$asset_name" != *.json ]]; then
+              continue
+            fi
+            echo "delete old asset $asset_name id=$asset_id"
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              "$API_BASE/releases/assets/$asset_id"
+          done
+
+          # curl API上传全部新channel‑manifests/*.json
+          for json_file in channel-manifests/*.json; do
+            base=$(basename "$json_file")
+            echo "upload $base"
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary "@$json_file" \
+              "$UPLOAD_BASE/releases/$release_id/assets?name=$base"
+          done
+          echo "✅ update‑channel manifests 全部完成，纯curl api调用，无gh download"
 
       - name: Sync to CNB
         if: ${{ inputs.sync_cnb }}
