@@ -252,26 +252,21 @@ jobs:
           PY
           ls -lh dist/
 
+      # ============【替换点】原Create GitHub Release全部shell脚本移除，改用softprops/action‑gh‑release@v2 ============
       - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_NOTES: ${{ steps.release_notes.outputs.notes }}
-        run: |
-          PRERELEASE_FLAG=""
-          if [ "${{ inputs.prerelease }}" = "true" ] || [ "${{ steps.meta.outputs.channel }}" = "beta" ]; then
-            PRERELEASE_FLAG="--prerelease"
-          fi
-          NOTES="${RELEASE_NOTES:-手动触发 GitHub Actions 构建发布。}"
-          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
-            gh release upload "${{ steps.meta.outputs.tag }}" dist/*.apk dist/*.json --clobber
-          else
-            gh release create "${{ steps.meta.outputs.tag }}" \
-              --target "$GITHUB_SHA" \
-              --title "${{ steps.meta.outputs.title }}" \
-              --notes "$NOTES" \
-              $PRERELEASE_FLAG \
-              dist/*.apk dist/*.json
-          fi
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.title }}
+          target_commitish: ${{ github.sha }}
+          body: ${{ steps.release_notes.outputs.notes != '' && steps.release_notes.outputs.notes || '手动触发 GitHub Actions 构建发布。' }}
+          prerelease: ${{ inputs.prerelease == true || steps.meta.outputs.channel == 'beta' }}
+          overwrite: true
+          files: |
+            dist/*.apk
+            dist/*.json
 
       - name: Publish update channel manifests
         env:
